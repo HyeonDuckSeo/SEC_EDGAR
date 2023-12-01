@@ -6,9 +6,14 @@ import requests
 import re
 from tqdm import tqdm 
 from bs4 import BeautifulSoup
-from IPython.display import display, HTML
+from IPython.display import display
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-pd.set_option('display.max_rows', 100)
+pd.set_option('display.max_rows', 50)
+
+# KIC CIK : 0001441689
+# BRK CIK : 0001067983
 
 
 class sec_13f_hr:
@@ -24,7 +29,7 @@ class sec_13f_hr:
         self.cusips_map, self.ticker_mapped_data = self.get_ticker_merged(self.cusips, self.holdings_change)
         self.sector_mapped_data, self.sector_weight_data = self.get_sector_info(self.ticker_mapped_data, file_path)
         
-        # self.analytics(self.sector_mapped_data, self.sector_weight_data)
+        self.analytics(self.sector_mapped_data, self.sector_weight_data)
     
     def get_sec_url(self, requested_cik):
         sec_url = 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={}&type=13F-HR&dateb=&owner=exclude&count=100&search_text='.format(requested_cik)
@@ -137,38 +142,47 @@ class sec_13f_hr:
             if df['Period of Report'][0] <= '2022-09-30':
                 df['Value'] = df['Value'] * 1000
                 df['Total Value'] = df['Total Value'] * 1000
-            
+                
+            df = df.groupby(['Name of Issuer', 'CUSIP', 'Total Value', 'Filing Date', 'Period of Report']).agg({'Value': 'sum', 'Shares': 'sum', 'Weight(%)': 'sum'}).reset_index()
             df = df.sort_values(by='Weight(%)', ascending=False).reset_index(drop=True)
             holdings_data = pd.concat([holdings_data, df], axis=0)
         return holdings_data   
     
     def get_holdings_change(self, holdings_data):
         change_data = pd.DataFrame()
-        sorted_list_asc = sorted(list(self.url_dict.keys()), reverse=False)
+        sorted_list_asc = sorted(list(url_dict.keys()), reverse=False)
         formatted_list_asc = [datetime.strptime(date, "%Y%m%d").strftime("%Y-%m-%d") for date in sorted_list_asc]
-        
+
         for i in range(len(formatted_list_asc)):
-            
-            if i == 0:
-                change_data_subset = holdings_data[holdings_data['Filing Date'] == formatted_list_asc[i]].copy()
-                change_data_subset.loc[:, 'Shares_Previous'] = None
-                change_data_subset.loc[:, 'Weight_previous(%)'] = None
-                change_data_subset.loc[:, 'Shares_Change'] = None
-                change_data_subset.loc[:, 'Weight_Change(%)'] = None
-                change_data = pd.concat([change_data, change_data_subset], axis=0)     
+
+            if i == 0:   
+                continue # 첫 데이터셋의 경우 이전 구성종목 데이터와 비교 불가능하여 skip
             else:
                 previous_date = formatted_list_asc[i-1]
                 current_date = formatted_list_asc[i]   
                 
-                previous_dataset = holdings_data[holdings_data['Filing Date'] == previous_date]
-                previous_dataset = previous_dataset.rename(columns={'Shares' : 'Shares_Previous', 'Weight(%)' : 'Weight_previous(%)'})
+                previous_dataset = holdings_data[holdings_data['Filing Date'] == previous_date].rename(columns=lambda x: x + '_Previous')
+                current_dataset = holdings_data[holdings_data['Filing Date'] == current_date]
+                merged_dataset = pd.merge(current_dataset, previous_dataset, left_on='CUSIP', right_on='CUSIP_Previous', how='outer')
                 
-                change_data_subset = holdings_data[holdings_data['Filing Date'] == current_date].merge(previous_dataset[['CUSIP', 'Shares_Previous', 'Weight_previous(%)']], on='CUSIP', how='left')
-                change_data_subset['Shares_Change'] = change_data_subset['Shares'] - change_data_subset['Shares_Previous'] 
-                change_data_subset['Weight_Change(%)'] = change_data_subset['Weight(%)'] - change_data_subset['Weight_previous(%)'] 
-                change_data = pd.concat([change_data, change_data_subset], axis=0)
-
-        holdings_change = change_data[['Filing Date', 'Period of Report', 'Name of Issuer', 'CUSIP', 'Total Value', 'Value', 'Weight(%)', 'Weight_previous(%)', 'Weight_Change(%)', 'Shares', 'Shares_Previous', 'Shares_Change']]
+                merged_dataset['Transaction'] = merged_dataset.apply(lambda row: 'Inclusion' if pd.isna(row['CUSIP_Previous']) else ('Exclusion' if pd.isna(row['CUSIP']) else ''), axis=1) # 종목 편출입 체크
+                merged_dataset['Name of Issuer'].fillna(merged_dataset['Name of Issuer_Previous'], inplace=True)                                                                            # 종목 편출 시 NaN 값 처리 (종목명)
+                merged_dataset['CUSIP'].fillna(merged_dataset['CUSIP_Previous'], inplace=True)                                                                                              # 종목 편출 시 NaN 값 처리 (종목코드)
+                merged_dataset['Total Value'].fillna(merged_dataset['Total Value'][0], inplace=True)                                                                                        # 종목 편출 시 NaN 값 처리 (총 자산가치)
+                merged_dataset['Filing Date'].fillna(merged_dataset['Filing Date'][0], inplace=True)                                                                                        # 종목 편출 시 NaN 값 처리 (공시일자)
+                merged_dataset['Period of Report'].fillna(merged_dataset['Period of Report'][0], inplace=True)                                                                              # 종목 편출 시 NaN 값 처리 (기준일자)
+                merged_dataset.update(merged_dataset[['Shares', 'Shares_Previous', 'Value', 'Value_Previous', 'Weight(%)', 'Weight(%)_Previous']].fillna(0))                                # 종목 편입 시 NaN 값 처리 
+                
+                merged_dataset['Shares_Change'] = merged_dataset['Shares'] - merged_dataset['Shares_Previous'] 
+                merged_dataset['Weight_Change(%)'] = merged_dataset['Weight(%)'] - merged_dataset['Weight(%)_Previous'] 
+                merged_dataset['Absolute_Weight_Change(%)'] = abs(merged_dataset['Weight_Change(%)'])
+                
+                merged_dataset = merged_dataset[['Filing Date', 'Filing Date_Previous', 'Period of Report', 'Period of Report_Previous',\
+                                                    'Total Value', 'Name of Issuer', 'CUSIP', 'Value',\
+                                                    'Shares', 'Shares_Previous', 'Shares_Change', 'Weight(%)', 'Weight(%)_Previous', 'Weight_Change(%)', 'Absolute_Weight_Change(%)', 'Transaction']]
+                merged_dataset = merged_dataset.sort_values(by=['Transaction', 'Weight(%)'], ascending=[False, False])
+                change_data = pd.concat([change_data, merged_dataset], axis=0).reset_index(drop=True)
+        holdings_change = change_data.copy()
         return holdings_change
     
     def get_all_cusips(self, holdings_change):
@@ -243,24 +257,38 @@ class sec_13f_hr:
             else:
                 full_data = pd.merge(full_data, subset, how='left', on='SECTOR_NAME_BIG')
         
-        sector_weight_data = full_data.head(9).set_index('SECTOR_NAME_BIG').T
+        sector_weight_data = full_data.set_index('SECTOR_NAME_BIG').T
         return sector_mapped_data, sector_weight_data
 
-    # def analytics(self, sector_mapped_data, sector_weight_data):
-    #     return
+    def analytics(self, sector_mapped_data, sector_weight_data):
         
-
-
-requested_cik = '0001441689'
-start_date = '20130801'
-file_path = 'C:/Users/shd4323/Desktop/sector_info.xlsx'
-SEC_13F_HR = sec_13f_hr(requested_cik, start_date, file_path)
+        # AUM & 구성종목 개수
+        df = sector_mapped_data.groupby('Period of Report').agg({'Value': ['sum', 'count']})
+        df.index = pd.to_datetime(df.index)
+        
+        fig, ax = plt.subplots(figsize=(20, 15))
+        ax.plot(df['Value']['sum'])
+        
+        ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x)))) # y축의 숫자 형식을 정수로 변경하고 천 단위로 콤마로 구분
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=12))                                # x축의 날짜 축을 6개월 단위로 설정
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))                              # x축 날짜 형태 YYYY-MM-DD로 설정
+        display(df)
+        plt.show()
+        
+        # 비중 변화 TOP 10
+        # weight_change = sector_mapped_data.sort_values(by=['Period of Report', 'Absolute_Weight_Change(%)'], ascending=[False, True])
+        
+        
+        
+requested_cik = input("Enter 10-digit CIK number : ")
+SEC_13F_HR = sec_13f_hr(requested_cik, start_date='20130801', file_path='C:/Users/shd4323/Desktop/SEC_13F_HR/sector_info.xlsx')
 
 # %%
+url_dict = SEC_13F_HR.url_dict
+holdings_data = SEC_13F_HR.holdings_data
 holdings_change = SEC_13F_HR.holdings_change
 cusips = SEC_13F_HR.cusips
 cusips_map = SEC_13F_HR.cusips_map
 ticker_mapped_data = SEC_13F_HR.ticker_mapped_data
 sector_mapped_data = SEC_13F_HR.sector_mapped_data
 sector_weight_data = SEC_13F_HR.sector_weight_data
-
